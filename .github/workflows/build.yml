@@ -886,7 +886,7 @@ jobs:
             artifacts/*.blockmap
           generate_release_notes: true
           fail_on_unmatched_files: false
-          token: ${{ secrets.RELEASE_TOKEN }}
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
 
   update-nix-release:
     name: update Nix release metadata
