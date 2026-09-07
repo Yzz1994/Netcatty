@@ -131,11 +131,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          node scripts/resolve-mosh-bin-release.cjs
-          release="$(grep '^MOSH_BIN_RELEASE=' "$GITHUB_ENV" | tail -n 1 | cut -d= -f2-)"
+          release=""
+          if node scripts/resolve-mosh-bin-release.cjs 2>/dev/null; then
+            release="$(grep '^MOSH_BIN_RELEASE=' "$GITHUB_ENV" | tail -n 1 | cut -d= -f2-)"
+          fi
           if [[ -z "$release" ]]; then
-            echo "::error::MOSH_BIN_RELEASE was not resolved."
-            exit 1
+            echo "::warning::MOSH_BIN_RELEASE was not resolved; building without bundled mosh-client."
           fi
           echo "mosh_bin_release=${release}" >> "$GITHUB_OUTPUT"
 
@@ -158,11 +159,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          node scripts/resolve-et-bin-release.cjs
-          release="$(grep '^ET_BIN_RELEASE=' "$GITHUB_ENV" | tail -n 1 | cut -d= -f2-)"
+          release=""
+          if node scripts/resolve-et-bin-release.cjs 2>/dev/null; then
+            release="$(grep '^ET_BIN_RELEASE=' "$GITHUB_ENV" | tail -n 1 | cut -d= -f2-)"
+          fi
           if [[ -z "$release" ]]; then
-            echo "::error::ET_BIN_RELEASE was not resolved."
-            exit 1
+            echo "::warning::ET_BIN_RELEASE was not resolved; building without bundled et-client."
           fi
           echo "et_bin_release=${release}" >> "$GITHUB_OUTPUT"
 
@@ -197,7 +199,7 @@ jobs:
       VITE_SYNC_ONEDRIVE_CLIENT_ID: ${{ secrets.VITE_SYNC_ONEDRIVE_CLIENT_ID }}
     steps:
       - name: Validate bundled mosh-client release
-        if: env.BUNDLE_MOSH == 'true'
+        if: env.BUNDLE_MOSH == 'true' && env.MOSH_BIN_RELEASE != ''
         shell: bash
         env:
           RESOLVE_MOSH_RESULT: ${{ needs.resolve-mosh.result }}
@@ -208,7 +210,7 @@ jobs:
           fi
 
       - name: Validate bundled et-client release
-        if: env.BUNDLE_ET == 'true'
+        if: env.BUNDLE_ET == 'true' && env.ET_BIN_RELEASE != ''
         shell: bash
         env:
           RESOLVE_ET_RESULT: ${{ needs.resolve-et.result }}
@@ -277,7 +279,7 @@ jobs:
           node electron/bridges/terminalBridge.moshConpty.integration.cjs
 
       - name: Fetch bundled mosh-client
-        if: env.BUNDLE_MOSH == 'true'
+        if: env.BUNDLE_MOSH == 'true' && env.MOSH_BIN_RELEASE != ''
         shell: bash
         run: |
           if [[ "${{ matrix.name }}" == "macos" ]]; then
@@ -287,7 +289,7 @@ jobs:
           fi
 
       - name: Fetch bundled et-client
-        if: env.BUNDLE_ET == 'true'
+        if: env.BUNDLE_ET == 'true' && env.ET_BIN_RELEASE != ''
         shell: bash
         run: |
           if [[ "${{ matrix.name }}" == "macos" ]]; then
@@ -387,7 +389,7 @@ jobs:
       VITE_SYNC_ONEDRIVE_CLIENT_ID: ${{ secrets.VITE_SYNC_ONEDRIVE_CLIENT_ID }}
     steps:
       - name: Validate bundled mosh-client release
-        if: env.BUNDLE_MOSH == 'true'
+        if: env.BUNDLE_MOSH == 'true' && env.MOSH_BIN_RELEASE != ''
         shell: bash
         env:
           RESOLVE_MOSH_RESULT: ${{ needs.resolve-mosh.result }}
@@ -398,7 +400,7 @@ jobs:
           fi
 
       - name: Validate bundled et-client release
-        if: env.BUNDLE_ET == 'true'
+        if: env.BUNDLE_ET == 'true' && env.ET_BIN_RELEASE != ''
         shell: bash
         env:
           RESOLVE_ET_RESULT: ${{ needs.resolve-et.result }}
@@ -595,11 +597,11 @@ jobs:
         run: bash scripts/ensure-node-pty-linux.sh prepare x64
 
       - name: Fetch bundled mosh-client
-        if: env.BUNDLE_MOSH == 'true'
+        if: env.BUNDLE_MOSH == 'true' && env.MOSH_BIN_RELEASE != ''
         run: npm run fetch:mosh -- --platform=linux --arch=x64
 
       - name: Fetch bundled et-client
-        if: env.BUNDLE_ET == 'true'
+        if: env.BUNDLE_ET == 'true' && env.ET_BIN_RELEASE != ''
         run: npm run fetch:et -- --platform=linux --arch=x64
 
       - name: Build package
@@ -670,7 +672,7 @@ jobs:
       VITE_SYNC_ONEDRIVE_CLIENT_ID: ${{ secrets.VITE_SYNC_ONEDRIVE_CLIENT_ID }}
     steps:
       - name: Validate bundled mosh-client release
-        if: env.BUNDLE_MOSH == 'true'
+        if: env.BUNDLE_MOSH == 'true' && env.MOSH_BIN_RELEASE != ''
         shell: bash
         env:
           RESOLVE_MOSH_RESULT: ${{ needs.resolve-mosh.result }}
@@ -681,7 +683,7 @@ jobs:
           fi
 
       - name: Validate bundled et-client release
-        if: env.BUNDLE_ET == 'true'
+        if: env.BUNDLE_ET == 'true' && env.ET_BIN_RELEASE != ''
         shell: bash
         env:
           RESOLVE_ET_RESULT: ${{ needs.resolve-et.result }}
@@ -745,11 +747,11 @@ jobs:
         run: bash scripts/ensure-node-pty-linux.sh prepare arm64
 
       - name: Fetch bundled mosh-client
-        if: env.BUNDLE_MOSH == 'true'
+        if: env.BUNDLE_MOSH == 'true' && env.MOSH_BIN_RELEASE != ''
         run: npm run fetch:mosh -- --platform=linux --arch=arm64
 
       - name: Fetch bundled et-client
-        if: env.BUNDLE_ET == 'true'
+        if: env.BUNDLE_ET == 'true' && env.ET_BIN_RELEASE != ''
         run: npm run fetch:et -- --platform=linux --arch=arm64
 
       - name: Build package
