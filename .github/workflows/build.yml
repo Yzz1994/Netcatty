@@ -789,9 +789,14 @@ jobs:
     # Only release on a strict v<MAJOR>.<MINOR>.<PATCH>[-pre] tag.
     # Manual workflow_dispatch can publish only when it is run from one
     # of those tags. PRs and branch pushes skip this job.
+    # `always()` + the success checks let forks publish Windows/Linux
+    # releases even when the macOS job fails (forks lack Apple signing
+    # and notarization secrets).
     if: |
-      startsWith(github.ref, 'refs/tags/v')
+      always()
+      && startsWith(github.ref, 'refs/tags/v')
       && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release))
+      && (needs.build-linux-x64.result == 'success' || needs.build-linux-arm64.result == 'success')
     permissions:
       contents: write
       actions: read
@@ -839,14 +844,19 @@ jobs:
             echo "After recovery:"
             ls -la artifacts/*.yml
           fi
-          # Final check — fail if any update yml is still missing
-          for f in latest-mac.yml latest.yml latest-linux.yml latest-linux-arm64.yml; do
+          # Final check — fail if a non-macOS update yml is still missing.
+          # Forks without Apple signing/notarization secrets never produce
+          # latest-mac.yml, so tolerate its absence and publish the rest.
+          for f in latest.yml latest-linux.yml latest-linux-arm64.yml; do
             if [ ! -f "artifacts/$f" ]; then
               echo "::error::$f is still missing after recovery attempt"
               exit 1
             fi
           done
-          echo "All update metadata files present."
+          if [ ! -f "artifacts/latest-mac.yml" ]; then
+            echo "::warning::latest-mac.yml missing (macOS job failed); publishing without macOS update metadata."
+          fi
+          echo "Update metadata check complete."
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
