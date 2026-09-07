@@ -732,14 +732,21 @@ function startPtyJob(ptyStream, command, options) {
     }
   }
 
-  let inputWriteTimer = null;
   let inputWriteGeneration = 0;
   function stopInputWrite() {
     inputWriteGeneration += 1;
-    clearTimeout(inputWriteTimer);
-    inputWriteTimer = null;
   }
   cleanupFns.push(stopInputWrite);
+
+  function completeInputDelivery(generation) {
+    // Input delivery is complete: only now does the startup deadline begin,
+    // so paced typing time never consumes the startup budget.
+    if (!finished && !cancelRequested && generation === inputWriteGeneration) {
+      deliveringInput = false;
+      armOutputTimeout();
+      if (!foundStart) armStartupTimeout();
+    }
+  }
 
   function writeInput(text) {
     stopInputWrite();
@@ -749,35 +756,26 @@ function startPtyJob(ptyStream, command, options) {
     clearTimeout(timeoutId);
     deliveringInput = true;
     const generation = inputWriteGeneration;
-    let offset = 0;
-    // Readline may overrun its input queue when long probes arrive in one
-    // write. Yield between bounded chunks; cancelled/replaced jobs must never
-    // finish typing an old command into a subsequent prompt.
-    const chunkSize = usesLiveShellProbe && text.length > 1024 ? 128 : text.length;
-    const writeNext = () => {
-      if (finished || cancelRequested || generation !== inputWriteGeneration) return;
-      let end = Math.min(offset + chunkSize, text.length);
-      // Do not split a UTF-16 surrogate pair across independently encoded writes.
-      if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1])) end -= 1;
-      ptyStream.write(text.slice(offset, end));
-      offset = end;
-      if (offset < text.length && generation === inputWriteGeneration && !finished && !cancelRequested) {
-        inputWriteTimer = setTimeout(() => {
-          try { writeNext(); } catch (error) {
-            finish(preStartOutput, -1, `Terminal input failed: ${error.message}`);
-          }
-        }, 30);
-      } else {
-        // Input delivery is complete: only now does the startup deadline
-        // begin, so paced typing time never consumes the startup budget.
-        if (!finished && !cancelRequested && generation === inputWriteGeneration) {
-          deliveringInput = false;
-          armOutputTimeout();
-          if (!foundStart) armStartupTimeout();
-        }
+
+    // Strict bastion hosts (QAX/奇安信, menu-driven jump bastions such as
+    // BHostSSH) treat one SSH channel write as a single keystroke and
+    // silently drop or mishandle every multi-character write. The AI probe
+    // and wrapper must therefore go out one Unicode code point per write —
+    // exactly what human keystrokes produce (#3146, cf. #3168/#3077). ssh2
+    // and node-pty both buffer writes without blocking, and a canonical-mode
+    // line discipline feeds the shell one character at a time, so this
+    // synchronous loop is safe and cannot overrun readline the way a single
+    // large write of a long probe could.
+    try {
+      for (const codePoint of Array.from(text)) {
+        if (finished || cancelRequested || generation !== inputWriteGeneration) return;
+        ptyStream.write(codePoint);
       }
-    };
-    writeNext();
+    } catch (error) {
+      finish(preStartOutput, -1, `Terminal input failed: ${error.message}`);
+      return;
+    }
+    completeInputDelivery(generation);
   }
 
   function writeWrappedCommand() {

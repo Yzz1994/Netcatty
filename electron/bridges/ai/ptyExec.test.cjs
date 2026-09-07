@@ -24,9 +24,23 @@ const {
 } = require("./shellUtils.cjs");
 
 class ShellBackedPty extends EventEmitter {
+  constructor() {
+    super();
+    // Per-code-point writes accumulate until the wrapper's terminating
+    // newline arrives, mirroring canonical-mode line discipline.
+    this.buffer = "";
+  }
   write(data) {
     if (data === "\x03") return;
-    const script = String(data).replace(/^\x0b\x15/, "");
+    this.buffer += String(data);
+    if (!this.buffer.endsWith("\n")) return;
+    // A trailing backslash-newline is a PS2 continuation; keep accumulating
+    // the next physical line. Only a non-continuation newline submits the
+    // whole (possibly multi-line) wrapper, matching canonical-mode input.
+    if (this.buffer.endsWith("\\\n")) return;
+    const line = this.buffer;
+    this.buffer = "";
+    const script = line.replace(/^\x0b\x15/, "");
     const result = spawnSync("sh", ["-c", script], { encoding: "utf8" });
     queueMicrotask(() => {
       this.emit("data", Buffer.from(result.stdout));
@@ -34,8 +48,25 @@ class ShellBackedPty extends EventEmitter {
   }
 }
 
-function markerFromWrite(data) {
-  return String(data).match(/(__NCMCP_[a-z0-9]+_[0-9a-f]+__)/i)?.[1] || null;
+// Mock base for strict-bastion-compatible per-code-point writes: accumulate
+// single-code-point writes until the full marker is parsed, then trigger
+// onMarker once (equivalent to the old single-write mock behavior).
+class MarkerTriggerPty extends EventEmitter {
+  constructor() {
+    super();
+    this._buffer = "";
+    this._marker = null;
+  }
+  write(data) {
+    if (this._marker) return;
+    this._buffer += String(data);
+    const marker = this._buffer.match(/(__NCMCP_[a-z0-9]+_[0-9a-f]+__)/i)?.[1];
+    if (marker) {
+      this._marker = marker;
+      this.onMarker(marker);
+    }
+  }
+  onMarker(_marker) {}
 }
 
 test("execViaPty completes when command output has no trailing newline", async () => {
@@ -50,10 +81,8 @@ test("execViaPty completes when command output has no trailing newline", async (
 });
 
 test("foreground PTY capture bounds a single 20 MiB output chunk and keeps its tail", async () => {
-  class LargeOutputPty extends EventEmitter {
-    write(data) {
-      const marker = markerFromWrite(data);
-      if (!marker) return;
+  class LargeOutputPty extends MarkerTriggerPty {
+    onMarker(marker) {
       queueMicrotask(() => {
         this.emit("data", Buffer.from(
           `${marker}_S\n${"x".repeat(20 * 1024 * 1024)}TAIL\n${marker}_E:0\n`,
@@ -74,10 +103,8 @@ test("foreground PTY capture bounds a single 20 MiB output chunk and keeps its t
 });
 
 test("foreground PTY capture preserves UTF-8 and markers split across chunks", async () => {
-  class SplitOutputPty extends EventEmitter {
-    write(data) {
-      const marker = markerFromWrite(data);
-      if (!marker) return;
+  class SplitOutputPty extends MarkerTriggerPty {
+    onMarker(marker) {
       queueMicrotask(() => {
         const start = Buffer.from(`${marker}_S\n`);
         const content = Buffer.from("中文回夝", "utf8");
@@ -101,12 +128,9 @@ test("foreground PTY capture preserves UTF-8 and markers split across chunks", a
 });
 
 test("foreground PTY timeout returns only a bounded tail", async () => {
-  class TimedOutPty extends EventEmitter {
+  class TimedOutPty extends MarkerTriggerPty {
     signal() {}
-    write(data) {
-      const marker = markerFromWrite(data);
-      if (!marker || this.started) return;
-      this.started = true;
+    onMarker(marker) {
       queueMicrotask(() => {
         this.emit("data", Buffer.from(`${marker}_S\n${"y".repeat(20 * 1024 * 1024)}`));
       });
@@ -125,12 +149,9 @@ test("foreground PTY timeout returns only a bounded tail", async () => {
 });
 
 test("foreground PTY cancellation returns only a bounded tail", async () => {
-  class CancelledPty extends EventEmitter {
+  class CancelledPty extends MarkerTriggerPty {
     signal() {}
-    write(data) {
-      const marker = markerFromWrite(data);
-      if (!marker || this.started) return;
-      this.started = true;
+    onMarker(marker) {
       queueMicrotask(() => {
         this.emit("data", Buffer.from(`${marker}_S\n${"z".repeat(20 * 1024 * 1024)}`));
       });
@@ -385,13 +406,14 @@ test("consecutive jobs wait for the PowerShell prompt after a split end marker",
   trackSessionIdlePrompt(session, "Microsoft Windows...\r\nPS C:\\Users\\alice>");
 
   for (const probe of ["PROBE_1", "PROBE_2"]) {
+    const writeStart = writes.length;
     const job = startPtyJob(pty, `Write-Output '${probe}'`, {
       shellKind: session.shellKind,
       loginShellHint: session._loginShellKind,
       timeoutMs: 20,
       expectedPrompt: getFreshIdlePrompt(session),
     });
-    const write = writes.at(-1);
+    const write = writes.slice(writeStart).join("");
     assert.match(write, /\$__NCMCP_/);
     assert.doesNotMatch(write, /cmd \/d \/s \/c/i);
 
@@ -588,6 +610,7 @@ test("a foreground wall deadline returns on time but blocks writes until the pro
   assert.equal(firstResult.stdout, "DONE");
   assert.equal(writes.filter((write) => write === "\x03").length, 0);
 
+  const writesBeforeSecondStart = writes.length;
   assert.throws(
     () => startPtyJob(pty, "Write-Output 'TOO_EARLY'", {
       shellKind: session.shellKind,
@@ -600,16 +623,17 @@ test("a foreground wall deadline returns on time but blocks writes until the pro
       && /waiting for the shell prompt/i.test(error.message)
     ),
   );
-  assert.equal(writes.length, 1);
+  assert.equal(writes.length, writesBeforeSecondStart);
 
   pty.emit("data", Buffer.from("PS C:\\Users\\alice>"));
+  const secondWriteStart = writes.length;
   const second = startPtyJob(pty, "Write-Output 'NEXT'", {
     shellKind: session.shellKind,
     loginShellHint: session._loginShellKind,
     timeoutMs: 1000,
     expectedPrompt: getFreshIdlePrompt(session),
   });
-  const secondWrite = writes.at(-1);
+  const secondWrite = writes.slice(secondWriteStart).join("");
   assert.match(secondWrite, /\$__NCMCP_/);
   assert.doesNotMatch(secondWrite, /cmd \/d \/s \/c/i);
   pty.emit(
@@ -637,6 +661,7 @@ test("startPtyJob clears PowerShell input in Windows, Emacs, and Vi editor state
       this.emacsChord = false;
       this.submittedLines = [];
       this.writes = [];
+      this.inputBuffer = "";
     }
 
     setPendingInput(text, { cursor = text.length, viInsertMode = true } = {}) {
@@ -762,10 +787,17 @@ test("startPtyJob clears PowerShell input in Windows, Emacs, and Vi editor state
       const text = String(data);
       this.writes.push(text);
 
+      // Per-code-point writes accumulate until the wrapper's terminating
+      // newline arrives, then the whole physical line is processed once.
+      this.inputBuffer += text;
+      if (!this.inputBuffer.includes("\n")) return;
+      const line = this.inputBuffer;
+      this.inputBuffer = "";
+
       const clearPrefix = buildPendingInputClearPrefix("powershell");
-      assert.ok(text.startsWith(clearPrefix));
+      assert.ok(line.startsWith(clearPrefix));
       for (const key of clearPrefix) this.applyEditKey(key);
-      const wrapper = text.slice(clearPrefix.length);
+      const wrapper = line.slice(clearPrefix.length).replace(/[\r\n]+$/, "");
       const submittedLine = this.viInsertMode
         ? `${this.pendingInput.slice(0, this.cursor)}${wrapper}${this.pendingInput.slice(this.cursor)}`
         : this.pendingInput;
@@ -823,10 +855,9 @@ test("startPtyJob clears PowerShell input in Windows, Emacs, and Vi editor state
       await job.resultPromise;
     }
 
-    assert.equal(pty.writes.length, 2);
+    assert.ok(pty.writes.length > 2, "wrapper is typed one code point per write");
     assert.equal(pty.submittedLines.length, 2);
-    for (const [index, submittedLine] of pty.submittedLines.entries()) {
-      assert.ok(pty.writes[index].startsWith("\x1bggd2147483647d\x1br\x1b\x1bi\x08$__NCMCP_"));
+    for (const submittedLine of pty.submittedLines) {
       assert.ok(submittedLine.startsWith("$__NCMCP_"));
       assert.doesNotMatch(submittedLine, /Write-Output 'USER'/);
       assert.doesNotMatch(submittedLine, /Write-Output 'USER_SECOND'/);
@@ -848,12 +879,39 @@ test("startPtyJob keeps the clear prefix for non-PowerShell sessions", async () 
     timeoutMs: 50,
     expectedPrompt: "$ ",
   });
-  assert.equal(writes.length, 1);
-  assert.ok(writes[0].startsWith("\x0b\x15"));
-  assert.match(writes[0], /__NCMCP_/);
+  assert.ok(writes.length > 1, "wrapper is typed one code point per write");
+  const combined = writes.join("");
+  assert.ok(combined.startsWith("\x0b\x15"));
+  assert.match(combined, /__NCMCP_/);
   job.cancel();
   pty.emit("data", Buffer.from("$ "));
   await job.resultPromise;
+});
+
+test("startPtyJob types the wrapper one code point per write for strict bastions (#3146)", async () => {
+  const writes = [];
+  class CapturePty extends EventEmitter {
+    write(data) {
+      writes.push(String(data));
+    }
+  }
+  const pty = new CapturePty();
+  const job = startPtyJob(pty, "echo test", {
+    shellKind: "posix",
+    timeoutMs: 50,
+    expectedPrompt: "$ ",
+  });
+  const wrapped = buildWrappedCommand("echo test", "posix", job.marker);
+  const expected = Array.from(`${buildPendingInputClearPrefix("posix")}${wrapped}`);
+  assert.deepEqual(writes, expected, "one write per code point");
+  for (const chunk of writes) {
+    assert.equal(Array.from(chunk).length, 1, "each write is a single code point");
+  }
+  job.cancel();
+  pty.emit("data", Buffer.from("$ "));
+  const result = await job.resultPromise;
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "Cancelled");
 });
 
 test("execViaRawPty does not prepend a line-clear before device commands", async () => {
