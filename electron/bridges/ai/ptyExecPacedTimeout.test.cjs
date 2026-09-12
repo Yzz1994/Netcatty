@@ -85,7 +85,7 @@ for (const cancel of [false, true]) {
       blocked = false;
       pty.emit('drain');
       t.mock.timers.tick(30);
-      assert.ok(writes.join('').endsWith('\n'));
+      while (!writes.join('').endsWith('\n')) t.mock.timers.tick(30);
       assert.ok(writes.every((value) => Array.from(value).length === 1));
       assert.ok(writes.includes('😀'));
       pty.emit('data', `${job.marker}_S\nOK\n${job.marker}_E:0\n`);
@@ -103,3 +103,25 @@ test('a stalled drain has a bounded wait and releases its listener', async (t) =
   assert.match((await job.resultPromise).error, /input timed out waiting for drain/);
   assert.equal(pty.listenerCount('drain'), 0);
 });
+
+for (const shellKind of ['powershell', 'cmd']) {
+  test(`bastion ${shellKind} input yields without a live probe and stops on cancel`, async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const pty = new EventEmitter();
+    const writes = [];
+    pty.write = (data) => { writes.push(data); };
+    const job = startPtyJob(pty, `echo ${'x'.repeat(12000)}`, {
+      shellKind, bastionKeystrokes: true, timeoutMs: 500,
+    });
+    assert.equal(writes.length, 128);
+    t.mock.timers.tick(30);
+    assert.equal(writes.length, 256);
+    assert.ok(writes.every((value) => Array.from(value).length === 1));
+    job.cancel();
+    const count = writes.length;
+    t.mock.timers.tick(30);
+    assert.equal(writes.length, count);
+    pty.emit('close');
+    assert.match((await job.resultPromise).error, /Cancelled/);
+  });
+}

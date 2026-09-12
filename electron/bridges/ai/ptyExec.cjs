@@ -767,7 +767,7 @@ function startPtyJob(ptyStream, command, options) {
     // Keep each write to one Unicode code point for strict bastions, while
     // retaining bounded pacing so long input cannot overrun shell queues.
     let offset = 0;
-    const batchSize = usesLiveShellProbe && text.length > 1024 ? 128 : text.length;
+    const batchSize = (usesLiveShellProbe || bastionKeystrokes) && text.length > 1024 ? 128 : text.length;
     const isCurrent = () => !finished && !cancelRequested && generation === inputWriteGeneration;
     const scheduleNext = () => {
       if (!isCurrent()) return;
