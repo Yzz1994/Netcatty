@@ -57,6 +57,7 @@ function startPtyJob(ptyStream, command, options) {
     shellKind,
     loginShellHint,
     probeLiveShell = false,
+    bastionKeystrokes = false,
     onProbeAborted,
     chatSessionId,
     abortSignal,
@@ -732,9 +733,15 @@ function startPtyJob(ptyStream, command, options) {
     }
   }
 
+  let inputWriteTimer = null;
+  let inputDrainListener = null;
   let inputWriteGeneration = 0;
   function stopInputWrite() {
     inputWriteGeneration += 1;
+    clearTimeout(inputWriteTimer);
+    inputWriteTimer = null;
+    if (inputDrainListener) ptyStream.removeListener("drain", inputDrainListener);
+    inputDrainListener = null;
   }
   cleanupFns.push(stopInputWrite);
 
@@ -743,7 +750,7 @@ function startPtyJob(ptyStream, command, options) {
     // so paced typing time never consumes the startup budget.
     if (!finished && !cancelRequested && generation === inputWriteGeneration) {
       deliveringInput = false;
-      armOutputTimeout();
+      if (!pendingEnd) armOutputTimeout();
       if (!foundStart) armStartupTimeout();
     }
   }
@@ -757,25 +764,47 @@ function startPtyJob(ptyStream, command, options) {
     deliveringInput = true;
     const generation = inputWriteGeneration;
 
-    // Strict bastion hosts (QAX/奇安信, menu-driven jump bastions such as
-    // BHostSSH) treat one SSH channel write as a single keystroke and
-    // silently drop or mishandle every multi-character write. The AI probe
-    // and wrapper must therefore go out one Unicode code point per write —
-    // exactly what human keystrokes produce (#3146, cf. #3168/#3077). ssh2
-    // and node-pty both buffer writes without blocking, and a canonical-mode
-    // line discipline feeds the shell one character at a time, so this
-    // synchronous loop is safe and cannot overrun readline the way a single
-    // large write of a long probe could.
-    try {
-      for (const codePoint of Array.from(text)) {
-        if (finished || cancelRequested || generation !== inputWriteGeneration) return;
-        ptyStream.write(codePoint);
+    // Keep each write to one Unicode code point for strict bastions, while
+    // retaining bounded pacing so long input cannot overrun shell queues.
+    let offset = 0;
+    const batchSize = usesLiveShellProbe && text.length > 1024 ? 128 : text.length;
+    const isCurrent = () => !finished && !cancelRequested && generation === inputWriteGeneration;
+    const scheduleNext = () => {
+      if (!isCurrent()) return;
+      inputWriteTimer = setTimeout(writeNext, 30);
+    };
+    const writeNext = () => {
+      try {
+        let end = Math.min(offset + batchSize, text.length);
+        if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1])) end -= 1;
+        while (offset < end) {
+          if (!isCurrent()) return;
+          const chunk = bastionKeystrokes
+            ? String.fromCodePoint(text.codePointAt(offset))
+            : text.slice(offset, end);
+          offset += chunk.length;
+          const writable = ptyStream.write(chunk);
+          if (!isCurrent()) return;
+          if (writable === false) {
+            inputDrainListener = () => {
+              inputDrainListener = null;
+              clearTimeout(inputWriteTimer);
+              scheduleNext();
+            };
+            ptyStream.once("drain", inputDrainListener);
+            inputWriteTimer = setTimeout(() => {
+              finish(preStartOutput, -1, "Terminal input timed out waiting for drain");
+            }, maxBufferedChars > 0 ? BG_STARTUP_TIMEOUT_MS : timeoutMs);
+            return;
+          }
+        }
+        if (offset < text.length) scheduleNext();
+        else completeInputDelivery(generation);
+      } catch (error) {
+        finish(preStartOutput, -1, `Terminal input failed: ${error.message}`);
       }
-    } catch (error) {
-      finish(preStartOutput, -1, `Terminal input failed: ${error.message}`);
-      return;
-    }
-    completeInputDelivery(generation);
+    };
+    writeNext();
   }
 
   function writeWrappedCommand() {
